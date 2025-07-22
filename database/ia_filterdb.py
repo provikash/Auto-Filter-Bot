@@ -1,7 +1,7 @@
 import logging
-from struct import pack
 import re
 import base64
+from struct import pack
 from pyrogram.file_id import FileId
 from pymongo.errors import DuplicateKeyError, OperationFailure 
 from umongo import Instance, Document, fields
@@ -21,144 +21,106 @@ class Media(Document):
     caption = fields.StrField(allow_none=True)
 
     class Meta:
-        indexes = ('$file_name', )
+        indexes = ('$file_name',)
         collection_name = COLLECTION_NAME
 
-
-
-#second db
+# Second database (optional)
+SecondMedia = None
 if SECOND_DATABASE_URL:
     second_client = AsyncIOMotorClient(SECOND_DATABASE_URL)
     second_db = second_client[DATABASE_NAME]
     second_instance = Instance.from_db(second_db)
 
     @second_instance.register
-    class SecondMedia(Document):
-
+    class SecondMediaCls(Document):
         file_id = fields.StrField(attribute='_id')
         file_name = fields.StrField(required=True)
         file_size = fields.IntField(required=True)
         caption = fields.StrField(allow_none=True)
-
         class Meta:
              indexes = ('$file_name', )
              collection_name = COLLECTION_NAME
+    SecondMedia = SecondMediaCls
 
+def _clean_text(s):
+    """Remove usernames and extra symbols for consistency."""
+    return re.sub(r"@\w+|(_|\-|\.|\+)", " ", str(s or ''))
 
-
+def _create_regex(query):
+    """Build regex for filenames matching."""
+    query = str(query or '').strip()
+    if not query:
+        return re.compile('.', re.IGNORECASE)
+    if ' ' not in query:
+        pattern = r'(\b|[\.\+\-_])' + re.escape(query) + r'(\b|[\.\+\-_])'
+    else:
+        pattern = re.escape(query).replace('\\ ', r'.*[\s\.\+\-_]')
+    try:
+        return re.compile(pattern, re.IGNORECASE)
+    except re.error:
+        return re.compile('.', re.IGNORECASE)
 
 async def save_file(media):
-    """Save file in database"""
-
-    # TODO: Find better way to get same file_id for same media to avoid duplicates
+    """Save file to main DB, fallback to second DB on OperationFailure."""
     file_id = unpack_new_file_id(media.file_id)
-    file_name = re.sub(r"@\w+|(_|\-|\.|\+)", " ", str(media.file_name))
-    file_caption = re.sub(r"@\w+|(_|\-|\.|\+)", " ", str(media.caption))
+    file_name = _clean_text(getattr(media, 'file_name', ''))
+    file_caption = _clean_text(getattr(media, 'caption', ''))
     try:
-        file = Media(
-            file_id=file_id,
-            file_name=file_name,
-            file_size=media.file_size,
-            caption=file_caption
-        )
+        doc = Media(file_id=file_id, file_name=file_name, file_size=media.file_size, caption=file_caption)
     except ValidationError:
-        print(f'Saving Error - {file_name}')
+        logging.error(f'Saving Error - {file_name}')
         return 'err'
-    else:
-        try:
-            await file.commit()
-        except DuplicateKeyError:      
-            print(f'Already Saved - {file_name}')
-            return 'dup'
-        except OperationFailure: #if 1st db is full
-            if SECOND_DATABASE_URL:
-                file = SecondMedia(
-                    file_id=file_id,
-                    file_name=file_name,
-                    file_size=media.file_size,
-                    caption=file_caption
-                    )
-                try:
-                    await file.commit()
-                    print(f'Saved to 2nd db - {file_name}')
-                    return 'suc'
-                except DuplicateKeyError:
-                    print(f'Already Saved in 2nd db - {file_name}')
-                    return 'dup'
-        else:
-            print(f'Saved - {file_name}')
-            return 'suc'
+    try:
+        await doc.commit()
+        logging.info(f'Saved - {file_name}')
+        return 'suc'
+    except DuplicateKeyError:
+        logging.debug(f'Already Saved - {file_name}')
+        return 'dup'
+    except OperationFailure:
+        if SecondMedia:
+            try:
+                sec_doc = SecondMedia(file_id=file_id, file_name=file_name, file_size=media.file_size, caption=file_caption)
+                await sec_doc.commit()
+                logging.info(f'Saved to 2nd db - {file_name}')
+                return 'suc'
+            except DuplicateKeyError:
+                logging.debug(f'Already in 2nd db - {file_name}')
+                return 'dup'
+    return 'err'
 
 async def get_search_results(query, max_results=MAX_BTN, offset=0, lang=None):
-    query = str(query) # to ensure the query is string to stripe.
-    query = query.strip()
-    if not query:
-        raw_pattern = '.'
-    elif ' ' not in query:
-        raw_pattern = r'(\b|[\.\+\-_])' + query + r'(\b|[\.\+\-_])'
-    else:
-        raw_pattern = query.replace(' ', r'.*[\s\.\+\-_]') 
-    try:
-        regex = re.compile(raw_pattern, flags=re.IGNORECASE)
-    except:
-        regex = query
-
-    filter = {'file_name': regex}
-
-    cursor = Media.find(filter)
-    results = [doc async for doc in cursor]
-
-    if SECOND_DATABASE_URL:
-        cursor2 = SecondMedia.find(filter)
-        results.extend([doc async for doc in cursor2])
-
-
-
+    regex = _create_regex(query)
+    filter_ = {'file_name': regex}
+    # First db search
+    results = [doc async for doc in Media.find(filter_)]
+    # Second db search if set
+    if SecondMedia:
+        results += [doc async for doc in SecondMedia.find(filter_)]
+    # Filter language if requested
     if lang:
-        lang_files = [file for file in results if lang in file.file_name.lower()]
-        files = lang_files[offset:][:max_results]
-        total_results = len(lang_files)
-        next_offset = offset + max_results
-        if next_offset >= total_results:
-            next_offset = ''
-        return files, next_offset, total_results
-        
-
-    total_results = len(results)
-    files = results[offset:][:max_results]
-    next_offset = offset + max_results
-    if next_offset >= total_results:
-        next_offset = ''   
-    return files, next_offset, total_results
-    
-    
-async def delete_files(query):
-    query = query.strip()
-    if not query:
-        raw_pattern = '.'
-    elif ' ' not in query:
-        raw_pattern = r'(\b|[\.\+\-_])' + query + r'(\b|[\.\+\-_])'
+        lang_files = [f for f in results if lang in f.file_name.lower()]
+        total = len(lang_files)
+        files = lang_files[offset:offset+max_results]
     else:
-        raw_pattern = query.replace(' ', r'.*[\s\.\+\-_]')
-    
-    try:
-        regex = re.compile(raw_pattern, flags=re.IGNORECASE)
-    except:
-        regex = query
-    filter = {'file_name': regex}
-    total = await Media.count_documents(filter)
-    files = Media.find(filter)
-    return total, files
+        total = len(results)
+        files = results[offset:offset+max_results]
+    next_offset = (offset + max_results) if (offset + max_results) < total else ''
+    return files, next_offset, total
+
+async def delete_files(query):
+    regex = _create_regex(query)
+    filter_ = {'file_name': regex}
+    total = await Media.count_documents(filter_)
+    return total, Media.find(filter_)
 
 async def get_file_details(query):
-    filter = {'file_id': query}
-    cursor = Media.find(filter)
-    filedetails = await cursor.to_list(length=1)
-    return filedetails
+    """Get first file matching the file_id."""
+    filter_ = {'file_id': query}
+    return await Media.find(filter_).to_list(length=1)
 
 def encode_file_id(s: bytes) -> str:
-    r = b""
-    n = 0
+    r, n = b"", 0
     for i in s + bytes([22]) + bytes([4]):
         if i == 0:
             n += 1
@@ -166,19 +128,10 @@ def encode_file_id(s: bytes) -> str:
             if n:
                 r += b"\x00" + bytes([n])
                 n = 0
-
             r += bytes([i])
     return base64.urlsafe_b64encode(r).decode().rstrip("=")
 
 def unpack_new_file_id(new_file_id):
     decoded = FileId.decode(new_file_id)
-    file_id = encode_file_id(
-        pack(
-            "<iiqq",
-            int(decoded.file_type),
-            decoded.dc_id,
-            decoded.media_id,
-            decoded.access_hash
-        )
-    )
-    return file_id
+    return encode_file_id(pack("<iiqq", int(decoded.file_type), decoded.dc_id, decoded.media_id, decoded.access_hash))
+    
